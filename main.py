@@ -52,9 +52,17 @@ from javax.swing.table import TableRowSorter
 from javax.swing.event import DocumentListener
 from java.util.regex import Pattern
 from urlparse import *
-import datetime 
+import datetime
 import time
 import sched
+import json
+import jarray
+
+from java.util import Base64
+from java.util import Arrays
+from java.util.concurrent import LinkedBlockingQueue, TimeUnit
+from java.lang import System, String
+from java.net import URL
 
 RED_COLOR = Color(255,135,135) 
 GREEN_COLOR = Color(107,255,127)
@@ -69,6 +77,19 @@ MONITOR_OFF_LABEL = "Monitor is OFF"
 SCOPE_MONITOR_COMMENT = "RTB-History-Monitor"
 
 TAGS = ['Login', 'Logout', 'MFA', 'PII']
+
+# Atualiza o label de status do push na thread do Swing (thread-safe)
+class PushStatusUpdater(Runnable):
+    def __init__(self, ext):
+        self._ext = ext
+
+    def run(self):
+        try:
+            self._ext.pushStatusLabel.setText(
+                "push: %d ok / %d falha / %d descartado" %
+                (self._ext.PUSH_OK, self._ext.PUSH_FAIL, self._ext.PUSH_DROP))
+        except:
+            pass
 
 class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController, AbstractTableModel, IContextMenuFactory, IExtensionStateListener):
     
@@ -98,6 +119,18 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         
         self.BAD_EXTENSIONS = self.BAD_EXTENSIONS_DEFAULT
         self.BAD_MIMES      = self.BAD_MIMES_DEFAULT
+
+        # --- push para o red-burp-watchdog (independente do ON/OFF do monitor) ---
+        # padrão DESLIGADO (opt-in): só ativa com PUSH_ENABLED="True" salvo
+        self.PUSH_ENABLED = (self._callbacks.loadExtensionSetting("PUSH_ENABLED") == "True")
+        self.PUSH_URL = self._callbacks.loadExtensionSetting("PUSH_URL") or "http://127.0.0.1:8787/ingest"
+        self.PUSH_OK = 0
+        self.PUSH_FAIL = 0
+        self.PUSH_DROP = 0
+        self._pushQueue = LinkedBlockingQueue(500)
+        self._pushRun = True
+        self._pushThread = Thread(target=self._pushWorker, name="rtb-watchdog-push")
+        self._pushThread.start()
 
         # create the log and a lock on which to synchronize when adding log entries
 
@@ -223,6 +256,25 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         self.markNotTestedRequestsProxy.addActionListener(self.handleNotTestedRequestsProxy)
         self.markNotTestedRequestsProxy.setBounds(50, 410, 420, 30)
 
+        # --- push para o red-burp-watchdog ---
+        self.pushOptionButton = JCheckBox("Push request/response to Watchdog listener")
+        self.pushOptionButton.setSelected(self.PUSH_ENABLED)
+        self.pushOptionButton.addActionListener(self.handlePushOption)
+        self.pushOptionButton.setBounds(50, 440, 420, 30)
+
+        self.pushUrlLabel = JLabel("Listener URL:")
+        self.pushUrlLabel.setBounds(50, 470, 100, 25)
+
+        self.pushUrlText = JTextArea(self.PUSH_URL)
+        self.pushUrlText.setBounds(150, 470, 310, 25)
+
+        self.pushUrlButton = JButton("Save")
+        self.pushUrlButton.addActionListener(self.handlePushUrlButton)
+        self.pushUrlButton.setBounds(470, 470, 70, 25)
+
+        self.pushStatusLabel = JLabel("push: 0 ok / 0 falha / 0 descartado")
+        self.pushStatusLabel.setBounds(50, 498, 520, 25)
+
 
         self.saveButton = JButton("Save now")
         self.saveButton.addActionListener(self.handleSaveButton)
@@ -271,6 +323,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         config.add(self.scopeOptionButton)
         config.add(self.markTestedRequestsProxy)
         config.add(self.markNotTestedRequestsProxy)
+        config.add(self.pushOptionButton)
+        config.add(self.pushUrlLabel)
+        config.add(self.pushUrlText)
+        config.add(self.pushUrlButton)
+        config.add(self.pushStatusLabel)
 
         iexport.add(self.saveButton)
         iexport.add(self.loadButton)
@@ -478,6 +535,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
     def extensionUnloaded(self):
         print 'extension unloading.. '
 
+        print 'stopping push worker.. '
+        self._pushRun = False
+
         print 'canceling scheduler.. '
         map(self.SC.cancel, self.SC.queue)
         return
@@ -593,7 +653,17 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
     def handleScopeOptionButton(self, event):
         self.CONFIG_INSCOPE = self.scopeOptionButton.isSelected()
         self._callbacks.saveExtensionSetting("CONFIG_INSCOPE", str(self.CONFIG_INSCOPE))
-        return 
+        return
+
+    def handlePushOption(self, event):
+        self.PUSH_ENABLED = self.pushOptionButton.isSelected()
+        self._callbacks.saveExtensionSetting("PUSH_ENABLED", str(self.PUSH_ENABLED))
+        return
+
+    def handlePushUrlButton(self, event):
+        self.PUSH_URL = self.pushUrlText.getText().strip()
+        self._callbacks.saveExtensionSetting("PUSH_URL", self.PUSH_URL)
+        return
 
     def handleBadExtensionsButton(self, event):
         #print "before BAD array: "
@@ -698,7 +768,130 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         self._lock.release()
         return
 
+    # ------------------------------------------------------------------
+    # Push para o red-burp-watchdog — tempo real, sem corte de 5KB.
+    # Politica de tamanho: completo <=512KB; truncado (headers + inicio do
+    # corpo) ate 2MB; acima de 2MB descarta (protege o heap do Burp).
+    # ------------------------------------------------------------------
+    PUSH_TOOLS = ("Proxy", "Repeater", "Target")
+    PUSH_FULL_LIMIT = 524288      # 512KB
+    PUSH_HARD_LIMIT = 2097152     # 2MB
+
+    def _watchdogPush(self, toolFlag, messageInfo):
+        try:
+            tool = self._callbacks.getToolName(toolFlag)
+            if tool not in self.PUSH_TOOLS:
+                return
+            req = messageInfo.getRequest()
+            if req is None:
+                return
+            url = self._helpers.analyzeRequest(messageInfo).getUrl()
+            if not self._callbacks.isInScope(url):
+                return
+            path = str(url.getPath())
+            for extension in self.BAD_EXTENSIONS:
+                if path.endswith(extension):
+                    return
+            resp = messageInfo.getResponse()
+            if resp is not None:
+                mime = self._helpers.analyzeResponse(resp).getStatedMimeType()
+                if mime and mime.lower() in self.BAD_MIMES:
+                    return
+            reqLen = len(req)
+            respLen = len(resp) if resp is not None else 0
+            if reqLen > self.PUSH_HARD_LIMIT or respLen > self.PUSH_HARD_LIMIT:
+                self.PUSH_DROP += 1
+                self._updatePushStatus()
+                return
+            respTrunc = False
+            if resp is not None and respLen > self.PUSH_FULL_LIMIT:
+                resp = self._truncateKeepHeaders(resp, self.PUSH_FULL_LIMIT)
+                respTrunc = True
+            payload = {
+                "ts": datetime.datetime.fromtimestamp(time.time()).isoformat(),
+                "tool": tool,
+                "request_b64": Base64.getEncoder().encodeToString(req),
+                "response_b64": (Base64.getEncoder().encodeToString(resp) if resp is not None else ""),
+                "resp_truncated": respTrunc,
+            }
+            if not self._pushQueue.offer(json.dumps(payload)):
+                self.PUSH_DROP += 1
+                self._updatePushStatus()
+        except:
+            pass  # o push nunca pode afetar o monitor/proxy
+
+    def _truncateKeepHeaders(self, arr, limit):
+        # mantem headers completos + inicio do corpo ate <limit> bytes
+        try:
+            n = len(arr)
+            if n <= limit:
+                return arr
+            scan = min(n, 65536)
+            hdrEnd = -1
+            i = 0
+            while i < scan - 3:
+                if arr[i] == 13 and arr[i+1] == 10 and arr[i+2] == 13 and arr[i+3] == 10:
+                    hdrEnd = i + 4
+                    break
+                i += 1
+            if hdrEnd < 0 or hdrEnd >= limit:
+                return Arrays.copyOfRange(arr, 0, limit)
+            bodyLen = limit - hdrEnd
+            out = jarray.zeros(limit, 'b')
+            System.arraycopy(arr, 0, out, 0, hdrEnd)
+            System.arraycopy(arr, hdrEnd, out, hdrEnd, bodyLen)
+            return out
+        except:
+            return arr
+
+    def _pushWorker(self):
+        while self._pushRun:
+            try:
+                body = self._pushQueue.poll(1, TimeUnit.SECONDS)
+            except:
+                continue
+            if body is None:
+                continue
+            try:
+                conn = URL(self.PUSH_URL).openConnection()
+                conn.setRequestMethod("POST")
+                conn.setConnectTimeout(1000)
+                conn.setReadTimeout(3000)
+                conn.setDoOutput(True)
+                conn.setRequestProperty("Content-Type", "application/json")
+                data = String(body).getBytes("UTF-8")
+                conn.setFixedLengthStreamingMode(len(data))
+                out = conn.getOutputStream()
+                out.write(data)
+                out.flush()
+                out.close()
+                code = conn.getResponseCode()
+                try:
+                    conn.getInputStream().close()
+                except:
+                    pass
+                if code == 200:
+                    self.PUSH_OK += 1
+                else:
+                    self.PUSH_FAIL += 1
+            except:
+                self.PUSH_FAIL += 1
+            self._updatePushStatus()
+
+    def _updatePushStatus(self):
+        try:
+            SwingUtilities.invokeLater(PushStatusUpdater(self))
+        except:
+            pass
+
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
+        # push watchdog: independente do ON/OFF do monitor; apenas na fase de resposta
+        try:
+            if (not messageIsRequest) and self.PUSH_ENABLED:
+                self._watchdogPush(toolFlag, messageInfo)
+        except:
+            pass
+
         # only process requests
 
         #print "processing httpMessage.."

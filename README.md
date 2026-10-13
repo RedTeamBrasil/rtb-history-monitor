@@ -112,14 +112,35 @@ As listas são configuráveis na aba **Config > General** e são persistidas ent
 
 ### Aba Import/Export
 
-| Opção        | Descrição                                                                 |
-|--------------|---------------------------------------------------------------------------|
-| State file   | Caminho do arquivo para salvar/carregar o estado do monitor               |
-| Save now     | Exporta o estado atual para o arquivo configurado                         |
-| Load now     | Importa um estado previamente salvo                                       |
-| Auto save    | Salva automaticamente a cada ~3 minutos                                   |
+| Opção        | Descrição                                                        |
+|--------------|------------------------------------------------------------------|
+| State file   | Caminho do arquivo para salvar/carregar o estado do monitor      |
+| Save now     | Exporta o estado atual para o arquivo configurado                |
+| Load now     | Importa um estado previamente salvo                              |
+| Auto save    | Salva automaticamente a cada ~3 minutos                          |
 
 O arquivo de estado é um CSV simples com os campos: `analyzed`, `url`, `method`, `date`, `tags`.
+
+### Push para o red-burp-watchdog
+
+Na aba **Config**, a opção **Push request/response to Watchdog listener** envia cada par
+request/response (de Proxy/Repeater/Target, dentro do escopo do Burp) em tempo real para um
+listener local — o modo push da skill `red-burp-watchdog` (ZCode), que os salva no formato do
+inventário de triagem (`traffic/`, `events.jsonl`, `endpoints.json`).
+
+- **Liga/desliga independente** do ON/OFF do monitor: o push tem o próprio checkbox e funciona
+  mesmo com o monitor desligado (respeitando sempre o escopo do Burp e a ferramenta de origem).
+  **Padrão desativado** (opt-in): marque o checkbox para ativar; o estado é persistido.
+- **Listener URL** (padrão `http://127.0.0.1:8787/ingest`): endereço do listener; ajuste a porta
+  se necessário e clique em **Save**.
+- O contador `push: N ok / N falha / N descartado` mostra o resultado dos envios.
+- Política de tamanho (protege o heap do Burp): corpos completos até 512KB; entre 512KB e 2MB
+  o response vai truncado (headers completos + início do corpo, marcado como truncado); acima
+  de 2MB o item é descartado. Extensões/MIMEs estáticos ignorados nas listas existentes também
+  não são enviados.
+- O listener fica em `~/.zcode/skills/red-burp-watchdog/scripts/burp_watchdog_listener.py`
+  (`python3 burp_watchdog_listener.py --dir <projeto>/burp-watchdog`).
+- Configurações persistidas nas extension settings: `PUSH_ENABLED`, `PUSH_URL`.
 
 ---
 
